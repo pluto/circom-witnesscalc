@@ -4,7 +4,7 @@
 // #[allow(dead_code)]
 mod field;
 pub mod graph;
-mod storage;
+pub mod storage;
 
 use std::collections::HashMap;
 use std::ffi::{c_void, c_char, c_int, CStr};
@@ -14,6 +14,7 @@ use ruint::ParseError;
 use crate::graph::Node;
 use wtns_file::FieldElement;
 use crate::field::M;
+use crate::storage::deserialize_witnesscalc_graph;
 
 pub type InputSignalsInfo = HashMap<String, (usize, usize)>;
 
@@ -31,13 +32,17 @@ fn prepare_status(status: *mut gw_status_t, code: GW_ERROR_CODE, error_msg: &str
             (*status).code = code;
             (*status).error_msg = libc::malloc(bs.len()+1) as *mut c_char;
             libc::memcpy((*status).error_msg as *mut c_void, bs.as_ptr() as *mut c_void, bs.len());
-            *((*status).error_msg.offset(bs.len() as isize)) = 0;
+            *((*status).error_msg.add(bs.len())) = 0;
         }
     }
 }
 
+/// # Safety
+/// 
+/// This function is unsafe because it dereferences raw pointers and can cause
+/// undefined behavior if misused.
 #[no_mangle]
-pub extern "C" fn gw_calc_witness(
+pub unsafe extern "C" fn gw_calc_witness(
     inputs: *const c_char,
     graph_data: *const c_void, graph_data_len: usize,
     wtns_data: *mut *mut c_void, wtns_len: *mut usize,
@@ -90,20 +95,22 @@ pub extern "C" fn gw_calc_witness(
 
     unsafe {
         *wtns_len = witness_data.len();
-        *wtns_data = libc::malloc(witness_data.len()) as *mut c_void;
+        *wtns_data = libc::malloc(witness_data.len());
+        if (*wtns_data).is_null() {
+            prepare_status(status, GW_ERROR_CODE_ERROR, "Failed to allocate memory for wtns_data");
+            return 1;
+        }
         libc::memcpy(*wtns_data, witness_data.as_ptr() as *const c_void, witness_data.len());
     }
 
     prepare_status(status, GW_ERROR_CODE_ERROR, "test error");
 
-    println!("OK");
-
-    return 0;
+    0
 }
 
 // create a wtns file bytes from witness (array of field elements)
 pub fn wtns_from_witness(witness: Vec<U256>) -> Vec<u8> {
-    let vec_witness: Vec<FieldElement<32>> = witness.iter().map(|a| u256_to_field_element(a)).collect();
+    let vec_witness: Vec<FieldElement<32>> = witness.iter().map(u256_to_field_element).collect();
     let mut buf = Vec::new();
     let mut wtns_f = wtns_file::WtnsFile::from_vec(vec_witness, u256_to_field_element(&M));
     wtns_f.version = 2;
@@ -118,7 +125,7 @@ pub fn calc_witness(inputs: &str, graph_data: &[u8]) -> Result<Vec<U256>, Error>
     let inputs = deserialize_inputs(inputs.as_bytes())?;
 
     let (nodes, signals, input_mapping): (Vec<Node>, Vec<usize>, InputSignalsInfo) =
-        postcard::from_bytes(graph_data).unwrap();
+        deserialize_witnesscalc_graph(std::io::Cursor::new(graph_data)).unwrap();
 
     let mut inputs_buffer = get_inputs_buffer(get_inputs_size(&nodes));
     populate_inputs(&inputs, &input_mapping, &mut inputs_buffer);
@@ -126,7 +133,7 @@ pub fn calc_witness(inputs: &str, graph_data: &[u8]) -> Result<Vec<U256>, Error>
     Ok(graph::evaluate(&nodes, inputs_buffer.as_slice(), &signals))
 }
 
-fn get_inputs_size(nodes: &Vec<Node>) -> usize {
+fn get_inputs_size(nodes: &[Node]) -> usize {
     let mut start = false;
     let mut max_index = 0usize;
     for &node in nodes.iter() {
@@ -144,7 +151,7 @@ fn get_inputs_size(nodes: &Vec<Node>) -> usize {
 
 fn populate_inputs(
     input_list: &HashMap<String, Vec<U256>>, inputs_info: &InputSignalsInfo,
-    input_buffer: &mut Vec<U256>) {
+    input_buffer: &mut [U256]) {
     for (key, value) in input_list {
         let (offset, len) = inputs_info[key];
         if len != value.len() {
@@ -153,7 +160,7 @@ fn populate_inputs(
         println!("input {}, offset {}, len {}", key, offset, len);
 
         for (i, v) in value.iter().enumerate() {
-            input_buffer[offset + i] = v.clone();
+            input_buffer[offset + i] = *v;
         }
     }
 }
@@ -183,6 +190,48 @@ impl From<ParseError> for Error {
     }
 }
 
+fn calc_len(vs: &Vec<serde_json::Value>) -> usize {
+    let mut len = vs.len();
+
+    for v in vs {
+        if let serde_json::Value::Array(arr) = v {
+            len += calc_len(arr)-1;
+        }
+    }
+
+    len
+}
+
+fn flatten_array(
+    key: &str, vs: &Vec<serde_json::Value>) -> Result<Vec<U256>, Error> {
+
+    let mut vals: Vec<U256> = Vec::with_capacity(calc_len(vs));
+
+    for v in vs {
+        match v {
+            serde_json::Value::String(s) => {
+                vals.push(U256::from_str_radix(s.as_str(),10)?);
+            }
+            serde_json::Value::Number(n) => {
+                vals.push(U256::from(
+                    n.as_u64()
+                        .ok_or(Error::InputsUnmarshal(format!(
+                            "signal value is not a positive integer: {}",
+                            key).to_string()))?));
+            }
+            serde_json::Value::Array(arr) => {
+                vals.extend_from_slice(flatten_array(key, arr)?.as_slice());
+            }
+            _ => {
+                return Err(Error::InputsUnmarshal(
+                    format!("inputs must be a string: {}", key).to_string()));
+            }
+        };
+
+    }
+    Ok(vals)
+}
+
 pub fn deserialize_inputs(inputs_data: &[u8]) -> Result<HashMap<String, Vec<U256>>, Error> {
     let v: serde_json::Value = serde_json::from_slice(inputs_data).unwrap();
 
@@ -207,24 +256,7 @@ pub fn deserialize_inputs(inputs_data: &[u8]) -> Result<HashMap<String, Vec<U256
                 inputs.insert(k.clone(), vec![i]);
             }
             serde_json::Value::Array(ss) => {
-                let mut vals: Vec<U256> = Vec::with_capacity(ss.len());
-                for v in &ss {
-                    let i = match v {
-                        serde_json::Value::String(s) => {
-                            U256::from_str_radix(s.as_str(),10)?
-                        }
-                        serde_json::Value::Number(n) => {
-                            if !n.is_u64() {
-                                return Err(Error::InputsUnmarshal("signal value is not a positive integer".to_string()));
-                            }
-                            U256::from(n.as_u64().unwrap())
-                        }
-                        _ => {
-                            return Err(Error::InputsUnmarshal("inputs must be a string".to_string()));
-                        }
-                    };
-                    vals.push(i);
-                }
+                let vals: Vec<U256> = flatten_array(k.as_str(), &ss)?;
                 inputs.insert(k.clone(), vals);
             }
             _ => {
@@ -243,6 +275,7 @@ mod tests {
     use prost::Message;
     use ruint::aliases::U256;
     use ruint::{uint};
+    use crate::flatten_array;
     use crate::proto::InputNode;
 
     #[test]
@@ -277,6 +310,29 @@ mod tests {
         };
         let v = i.encode_to_vec();
         println!("{:?}", v.len());
+    }
+
+    #[test]
+    fn test_flatten_array() {
+        let data = r#"["123", "456", 100500, [1, 2]]"#;
+        let v = serde_json::from_str(data).unwrap();
+        let res = flatten_array("key1", &v).unwrap();
+
+        let want = vec![uint!(123_U256), uint!(456_U256), uint!(100500_U256), uint!(1_U256), uint!(2_U256)];
+        assert_eq!(want, res);
+    }
+
+    #[test]
+    fn test_calc_len() {
+        let data = r#"["123", "456", 100500]"#;
+        let v = serde_json::from_str(data).unwrap();
+        let l = super::calc_len(&v);
+        assert_eq!(l, 3);
+
+        let data = r#"["123", ["456", true], 100500]"#;
+        let v = serde_json::from_str(data).unwrap();
+        let l = super::calc_len(&v);
+        assert_eq!(l, 4);
     }
 
 }

@@ -1,4 +1,4 @@
-use compiler::circuit_design::template::{TemplateCode};
+use compiler::circuit_design::template::TemplateCode;
 use compiler::compiler_interface::{run_compiler, Circuit, Config};
 use compiler::intermediate_representation::ir_interface::{AddressType, CallBucket, ComputeBucket, CreateCmpBucket, FinalData, InputInformation, Instruction, InstructionPointer, LoadBucket, LocationRule, OperatorType, ReturnBucket, ReturnType, StatusInput, StoreBucket, ValueBucket, ValueType};
 use constraint_generation::{build_circuit, BuildConfig};
@@ -16,6 +16,7 @@ use lazy_static::lazy_static;
 use type_analysis::check_types::check_types;
 use circom_witnesscalc::{deserialize_inputs, InputSignalsInfo};
 use circom_witnesscalc::graph::{optimize, Node, Operation, UnoOperation, TresOperation, Nodes, NodeConstErr, NodeIdx};
+use circom_witnesscalc::storage::serialize_witnesscalc_graph;
 
 pub const M: U256 =
     uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
@@ -173,7 +174,7 @@ fn operator_argument_instruction_n(
                         LocationRule::Mapped { ref signal_code, ref indexes } => {
                             calc_mapped_signal_idx(
                                 subcomponents, subcomponent_idx, io_map,
-                                signal_code.clone(), indexes, nodes, vars,
+                                *signal_code, indexes, nodes, vars,
                                 component_signal_start, signal_node_idx,
                                 print_debug, call_stack)
                         }
@@ -227,8 +228,7 @@ fn operator_argument_instruction_n(
                                 result.push(idx);
                             },
                             Some(Var::Value(ref v)) => {
-                                result.push(
-                                    nodes.push(Node::Constant(v.clone())).0);
+                                result.push(nodes.push(Node::Constant(*v)).0);
                             }
                             None => { panic!("variable is not set: {}, {:?}",
                                              load_bucket.line, call_stack); }
@@ -310,7 +310,7 @@ fn operator_argument_instruction(
                         LocationRule::Mapped { ref signal_code, ref indexes } => {
                             calc_mapped_signal_idx(
                                 subcomponents, subcomponent_idx, io_map,
-                                signal_code.clone(), indexes, nodes, vars,
+                                *signal_code, indexes, nodes, vars,
                                 component_signal_start, signal_node_idx,
                                 print_debug, call_stack)
                         }
@@ -344,7 +344,7 @@ fn operator_argument_instruction(
                             match vars[var_idx] {
                                 Some(Var::Node(idx)) => idx,
                                 Some(Var::Value(ref v)) => {
-                                    nodes.push(Node::Constant(v.clone())).0
+                                    nodes.push(Node::Constant(*v)).0
                                 }
                                 None => { panic!("variable is not set"); }
                             }
@@ -440,14 +440,14 @@ fn node_from_compute_bucket(
             &compute_bucket.stack[1], nodes, signal_node_idx, vars,
             component_signal_start, subcomponents, io_map, print_debug,
             call_stack);
-        return Node::Op(op.clone(), arg1, arg2);
+        return Node::Op(*op, arg1, arg2);
     }
     if let Some(op) = UNO_OPERATORS_MAP.get(&compute_bucket.op) {
         let arg1 = operator_argument_instruction(
             &compute_bucket.stack[0], nodes, signal_node_idx, vars,
             component_signal_start, subcomponents, io_map, print_debug,
             call_stack);
-        return Node::UnoOp(op.clone(), arg1);
+        return Node::UnoOp(*op, arg1);
     }
     panic!(
         "not implemented: this operator is not supported to be converted to Node: {}",
@@ -462,21 +462,47 @@ fn calc_mapped_signal_idx(
     signal_node_idx: &mut Vec<usize>, print_debug: bool,
     call_stack: &Vec<String>) -> (usize, String) {
 
-    let template_id = &subcomponents[subcomponent_idx].as_ref().unwrap().template_id;
+    let template_id = &subcomponents[subcomponent_idx]
+        .as_ref()
+        .unwrap()
+        .template_id;
     let signals = io_map.get(template_id).unwrap();
     let template_def = format!("<template id: {}>", template_id);
     let def: &IODef = &signals[signal_code];
     let mut map_access = def.offset;
 
-    if indexes.len() > 0 {
-        if indexes.len() > 1 {
-            todo!("not implemented yet");
+    if !indexes.is_empty() {
+        let lengths = &def.lengths;
+        // I'm not sure if this assert should be here.
+        assert_eq!(
+            lengths.len(),
+            indexes.len(),
+            "Number of indexes does not match the number of dimensions"
+        );
+
+        // Compute strides
+        let mut strides = vec![1usize; lengths.len()];
+        for i in (0..lengths.len() - 1).rev() {
+            strides[i] = strides[i + 1] * lengths[i + 1];
         }
-        let map_index = calc_expression(
-            &indexes[0], nodes, vars, component_signal_start,
-            signal_node_idx, subcomponents, io_map, print_debug, call_stack);
-        let map_index = map_index.must_const_usize(nodes, call_stack);
-        map_access += map_index;
+
+        // Calculate linear index
+        for (i, idx_ip) in indexes.iter().enumerate() {
+            let idx_value = calc_expression(
+                idx_ip, nodes, vars, component_signal_start, signal_node_idx,
+                subcomponents, io_map, print_debug, call_stack);
+            let idx_value = idx_value.must_const_usize(nodes, call_stack);
+
+            // Ensure index is within bounds
+            assert!(
+                idx_value < lengths[i],
+                "Index out of bounds: index {} >= dimension size {}",
+                idx_value,
+                lengths[i]
+            );
+
+            map_access += idx_value * strides[i];
+        }
     }
 
     (map_access, template_def)
@@ -864,7 +890,7 @@ fn store_function_return_results_into_subsignal(
                     }
                     Some(Var::Value(v)) => {
                         src_node_idxs.push(
-                            nodes.push(Node::Constant(v.clone())).0);
+                            nodes.push(Node::Constant(v)).0);
                     }
                     None => {
                         panic!("variable at index {} is not set", i);
@@ -877,10 +903,10 @@ fn store_function_return_results_into_subsignal(
             assert_eq!(final_data.context.size, 1);
             match v {
                 Var::Node(node_idx) => {
-                    src_node_idxs.push(node_idx.clone());
+                    src_node_idxs.push(*node_idx);
                 }
                 Var::Value(v) => {
-                    src_node_idxs.push(nodes.push(Node::Constant(v.clone())).0);
+                    src_node_idxs.push(nodes.push(Node::Constant(*v)).0);
                 }
             }
         }
@@ -2242,8 +2268,8 @@ fn main() {
         "number of nodes after optimize {}, signals {}",
         nodes.len(), witness_node_idxes.len());
 
-    let bytes = postcard::to_stdvec(&(&nodes.0, &witness_node_idxes, &input_signals)).unwrap();
-    fs::write(&args.graph_file, bytes).unwrap();
+    let f = fs::File::create(&args.graph_file).unwrap();
+    serialize_witnesscalc_graph(f, &nodes, &witness_node_idxes, &input_signals).unwrap();
 
     println!("circuit graph saved to file: {}", &args.graph_file)
 }
